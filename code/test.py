@@ -1,62 +1,10 @@
-# import torch
-# x = torch.randn(3, 10)
-# print(x)
-# print(x.shape)
-# num_index = []
-# for i in range(10):
-#     if i is not 8:
-#         num_index.append(i)
-#
-# num_index = torch.tensor(num_index)
-# print(num_index)
-# x = torch.index_select(x, 1, num_index)
-# print(x)
 
-# import torch.nn.functional as F
-# import torch
-# import numpy as np
-# x = torch.from_numpy(np.arange(1, 31).reshape(3, 10)).type(torch.FloatTensor)
-# print(x.shape)
-# x = F.softmax(x, 1)
-# print(x)
-# print(x.shape)
-# import torch
-# import numpy as np
-# x_array = np.arange(1, 31).reshape(3, 10)
-# print(x_array)
-# print(x_array.shape)
-# x_array = np.repeat(x_array, repeats=2, axis=1)
-# x = torch.from_numpy(x_array)
-# print(x)
-# print(x.shape)
+result_bs_64 = {(0.05, 0.025): 0.8255104070268675, (0.05, 0.01): 1.6543130102819155,
+        (0.05, 0.005): 2.4816632003252947, (0.025, 0.025): 3.3038936615881536,
+        (0.025, 0.01): 4.128672446067421, (0.025, 0.005): 4.957671977748744,
+        (0.01, 0.025): 5.788353753796929, (0.01, 0.01): 6.614425393197451, (0.01, 0.005): 7.437537401525915}
 
-import torch
-
-# a = torch.Tensor([[1, 2],
-#                   [3, 4],
-#                   [5, 6]])
-# b = torch.Tensor([[1, 2],
-#                   [3, 4],
-#                   [5, 6]])
-# c = torch.Tensor([[10000, 20000],
-#                   [30000, 40000],
-#                   [50000, 60000]])
-# test = torch.Tensor([3, 7, 11])
-# a_sum = torch.sum(a, 1)
-# b_sum = torch.sum(b, 1)
-# print(a_sum)
-# print(a_sum.shape)
-# print(b_sum)
-# print(b_sum.shape)
-# print(a_sum == test)
-# print(torch.cat([a, b], 1))
-# print(a.shape)
-# my_list = [a, b, c]
-# x = torch.stack(my_list, 0).reshape(3, 6)
-# print(x)
-# print(x.shape)
-
-label = torch.LongTensor([0]).unsqueeze(1)
-print(label)
-one_hot = torch.zeros(1, 4).scatter_(1, label, 1)
-print(one_hot)
+result_bs_128 = {(0.05, 0.01): 0.8295201856889731, (0.05, 0.005): 1.6601419342240191,
+                 (0.025, 0.025): 2.492719813744914, (0.025, 0.01): 3.323947091438084,
+                 (0.025, 0.005): 4.143782538195367, (0.01, 0.025): 4.9739182231101635,
+                 (0.01, 0.01): 5.801799154399122, (0.01, 0.005): 6.6307871820410025}
