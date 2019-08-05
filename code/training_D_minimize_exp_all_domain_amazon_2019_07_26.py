@@ -333,7 +333,6 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             torch.save(D.state_dict(),
                        '{}/netD.pth'.format(opt.exp2_model_save_file))
 
-
     # end of training
     log.info(f'Best average validation accuracy: {best_avg_acc}')
 

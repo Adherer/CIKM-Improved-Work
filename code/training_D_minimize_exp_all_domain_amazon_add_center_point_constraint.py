@@ -1,3 +1,5 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 from collections import defaultdict
 import itertools
 import logging
@@ -12,13 +14,21 @@ from torchnet.meter import ConfusionMeter
 from data_prep.msda_preprocessed_amazon_dataset import get_msda_amazon_datasets
 from man_models import *
 import utils
-import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
 from mpl_toolkits.mplot3d import Axes3D
 from time import time
 from tensorboardX import SummaryWriter
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "5"
+import seaborn as sns
+import matplotlib.pyplot as plt
+import matplotlib.patheffects as PathEffects
+
+# ---------------------- 2019.07.26更新 ---------------------- #
+# 1.加上网格搜索，注意看哪些参数是需要网格搜索完成的，另外注意控制变量法来搜索参数
+# 2.加上tensorboardX可视化loss变化情况，主要看private feature和shared feature经过判别器之后的loss变化情况
+#   以及Classifier的loss
+# ---------------------- 2019.07.26更新 ---------------------- #
+
+
 # ---------------------- 最小化实验的简单思路 ---------------------- #
 # 由于师兄设计的模型比较复杂，可能需要再进一步思考收敛策略，因此将实验最小化，争取先调出D
 # 调出D的意思就是，争取让各个F_d都分开，并且F_s与各个F_d之间均有重叠，可以利用t-SNE进行可视化操作
@@ -57,26 +67,20 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
 
     # ---------------------- dataloader ---------------------- #
     # dataset loaders
-    print(unlabeled_sets["books"][0])
-    print(unlabeled_sets["books"][999])
-    print(unlabeled_sets["books"][1999])
-    print(unlabeled_sets["books"][0][0].shape)
-    print(unlabeled_sets["books"][0][1].shape)
-    print(unlabeled_sets["books"][0][1].item())
     train_loaders, unlabeled_loaders = {}, {}
     train_iters, unlabeled_iters = {}, {}
     dev_loaders, test_loaders = {}, {}
     # 加载有label的训练数据
     for domain in opt.domains:
         train_loaders[domain] = DataLoader(train_sets[domain],
-                opt.batch_size, shuffle=True)
+                                           opt.batch_size, shuffle=True)
         train_iters[domain] = iter(train_loaders[domain])
 
     for domain in opt.dev_domains:
         dev_loaders[domain] = DataLoader(dev_sets[domain],
-                opt.batch_size, shuffle=False)
+                                         opt.batch_size, shuffle=False)
         test_loaders[domain] = DataLoader(test_sets[domain],
-                opt.batch_size, shuffle=False)
+                                          opt.batch_size, shuffle=False)
 
     for domain in opt.all_domains:
         if domain in opt.unlabeled_domains:
@@ -125,6 +129,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
 
     # training
     best_acc, best_avg_acc = defaultdict(float), 0.0
+    # writer = SummaryWriter()
     for epoch in range(opt.max_epoch):
         F_s.train()
         C.train()
@@ -199,6 +204,8 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
 
             # ********************** F&C iteration ********************** #
             # ---------------------- update F_s & F_ds with C gradients on all labeled domains ---------------------- #
+            lamda1 = 0.05
+            lamda2 = 0.2
             utils.unfreeze_net(F_s)
             map(utils.unfreeze_net, F_d.values())
             utils.unfreeze_net(C)
@@ -215,7 +222,13 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                 domain_feat = F_d[domain](inputs)
                 features = torch.cat((shared_feat, domain_feat), dim=1)
                 c_outputs = C(features)
-                l_c = functional.nll_loss(c_outputs, targets)
+                loss_part_1 = functional.nll_loss(c_outputs, targets)
+                loss_part_2 = lamda1 * margin_regularization(inputs, targets, F_d[domain])
+                loss_part_3 = - lamda2 * center_point_constraint(domain_feat, targets)
+                print("loss_part_1: " + str(loss_part_1))
+                print("loss_part_2: " + str(loss_part_2))
+                print("loss_part_3: " + str(loss_part_3))
+                l_c = loss_part_1 + loss_part_2 + loss_part_3
                 l_c.backward(retain_graph=True)
                 _, pred = torch.max(c_outputs, 1)
                 total[domain] += targets.size(0)
@@ -253,7 +266,8 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                     shared_l_d = functional.kl_div(shared_d_outputs, d_targets, size_average=False)
                     private_l_d, l_d_sum = 0.0, 0.0
                     if domain != opt.dev_domains[0]:
-                        private_l_d = functional.kl_div(private_d_outputs, d_targets, size_average=False) * -1. / len(opt.domains)
+                        private_l_d = functional.kl_div(private_d_outputs, d_targets, size_average=False) * -1. / len(
+                            opt.domains)
                     if opt.shared_lambd > 0:
                         l_d_sum = shared_l_d * opt.shared_lambd
                     else:
@@ -282,6 +296,8 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             optimizer.step()
             # ********************** F&C iteration ********************** #
         # end of epoch
+        # writer.add_scalar('train/classifier-loss', l_c, epoch)
+        # writer.add_scalars('train/shared-private-loss', {'shared': shared_l_d, 'private': private_l_d}, epoch)
         log.info('Ending epoch {}'.format(epoch + 1))
         if d_total > 0:
             log.info('shared D Training Accuracy: {}%'.format(100.0 * shared_d_correct / d_total))
@@ -337,36 +353,43 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
         F_d[domain].load_state_dict(torch.load(os.path.join(opt.exp2_model_save_file,
                                                             f'net_F_d_{domain}.pth')))
     num_iter = len(train_loaders[opt.domains[0]])
-    visual_features, domain_labels = get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_s, F_d)
-    return best_acc, visual_features, domain_labels
+    # visual_features暂时不加上shared feature
+    # visual_features, senti_labels = get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_s, F_d)
+    visual_features, senti_labels = get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_d)
+    return best_acc, visual_features, senti_labels
 
 
-def get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_s, F_d):
-    visual_features = None
-    domain_labels = None
+def get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_d):
+    negative_visual_features = None
+    positive_visual_features = None
+    negative_senti_labels = None
+    positive_senti_labels = None
     for _ in tqdm(range(num_iter)):
-        for domain in opt.all_domains:
-            d_inputs, _ = utils.endless_get_next_batch(
+        for domain in opt.domains:
+            d_inputs, targets = utils.endless_get_next_batch(
                 unlabeled_loaders, unlabeled_iters, domain)
-            d_targets = utils.get_domain_label(opt.loss, domain, len(d_inputs))
-            if domain != opt.dev_domains[0]:
-                private_features = F_d[domain](d_inputs)
-            shared_features = F_s(d_inputs)
-            if visual_features is None:
-                if domain != opt.dev_domains[0]:
-                    visual_features = torch.cat([private_features, shared_features], 0)
-                    domain_labels = torch.cat([d_targets, d_targets], 0)
+            private_features = F_d[domain](d_inputs)
+            for i in range(targets.shape[0]):
+                targets_i = torch.unsqueeze(targets[i], 0)
+                private_features_i = torch.unsqueeze(private_features[i], 0)
+                if targets[i].item() == 0:
+                    if negative_visual_features is None:
+                        negative_visual_features = private_features_i
+                        negative_senti_labels = targets_i
+                    else:
+                        negative_visual_features = torch.cat([negative_visual_features, private_features_i], 0)
+                        negative_senti_labels = torch.cat([negative_senti_labels, targets_i], 0)
                 else:
-                    visual_features = shared_features
-                    domain_labels = d_targets
-            else:
-                if domain != opt.dev_domains[0]:
-                    visual_features = torch.cat([visual_features, private_features, shared_features], 0)
-                    domain_labels = torch.cat([domain_labels, d_targets, d_targets], 0)
-                else:
-                    visual_features = torch.cat([visual_features, shared_features], 0)
-                    domain_labels = torch.cat([domain_labels, d_targets], 0)
-    return visual_features, domain_labels
+                    if positive_visual_features is None:
+                        positive_visual_features = private_features_i
+                        positive_senti_labels = targets_i
+                    else:
+                        positive_visual_features = torch.cat([positive_visual_features, private_features_i], 0)
+                        positive_senti_labels = torch.cat([positive_senti_labels, targets_i], 0)
+
+    visual_features = torch.cat([negative_visual_features, positive_visual_features], 0)
+    senti_labels = torch.cat([negative_senti_labels, positive_senti_labels], 0)
+    return visual_features, senti_labels
 
 
 def evaluate(name, loader, F_s, F_d, C):
@@ -396,44 +419,105 @@ def evaluate(name, loader, F_s, F_d, C):
     log.debug(confusion.conf)
     return acc
 
+# 这个正则明天再来检查一下正确性(与公式对比)，然后再画出T-sne的图来
+def margin_regularization(inputs, targets, F_d):
+    # print(inputs[0].shape)      # torch.Size([8, 42])
+    # print(targets.shape)        # torch.Size([8, 42])
+    margin = 9
+    samples_i = []
+    samples_i_label = []
+    features = F_d(inputs)
+    # print(features.shape)       # torch.Size([8, 64])
+    targets = targets.cpu()
+    for i in range(opt.batch_size):
+        samples_i.append(torch.stack([features[i] for _ in range(opt.batch_size)], 0))
+        samples_i_label.append(torch.stack([targets[i] for _ in range(opt.batch_size)], 0))
 
-def plot_embedding(data):
-    x_min, x_max = np.min(data, 0), np.max(data, 0)
-    data = (data - x_min) / (x_max - x_min)
-    return data
+    samples_i = torch.stack(samples_i, 0)
+    samples_i_label = torch.stack(samples_i_label, 0)
+    # print(samples_i.shape)      # torch.Size([8, 8, 42])
+    # print(samples_i_label.shape)    # torch.Size([8, 8])
+
+    samples_j = torch.stack([features for _ in range(opt.batch_size)], 0)  # 大x_j
+    samples_j_label = torch.stack([targets for _ in range(opt.batch_size)], 0) # 大x_j_label
+    # print(samples_j.shape)
+    # print(samples_j_label.shape)
+    mask_matrix = (samples_i_label == samples_j_label).numpy()
+    sub_matrix = (samples_i - samples_j).detach().cpu().numpy()
+    norm2_matrix = np.linalg.norm(sub_matrix, axis=2, ord=2)
+    # print(norm2_matrix)
+    result_matrix = mask_matrix * norm2_matrix + (1 - mask_matrix) * np.maximum(0, margin - norm2_matrix)
+    return np.sum(result_matrix) / (opt.batch_size ** 2)
 
 
-def t_sne(domain, n_components, visual_features, domain_labels):
-    if n_components == 2:
-        tsne_features = TSNE(n_components=n_components, random_state=35).fit_transform(visual_features)
-        aim_data = plot_embedding(tsne_features)
-        print(aim_data.shape)
-        plt.figure()
-        plt.subplot(111)
-        plt.scatter(aim_data[:, 0], aim_data[:, 1], c=domain_labels)
-        plt.title("T-SNE Digits")
-        plt.savefig(domain + "_new_30_epoch_" + "T-SNE_Digits.png")
-    elif n_components == 3:
-        tsne_features = TSNE(n_components=n_components, random_state=35).fit_transform(visual_features)
-        aim_data = plot_embedding(tsne_features)
-        fig = plt.figure()
-        ax = Axes3D(fig)
-        ax.scatter(aim_data[:, 0], aim_data[:, 1], aim_data[:, 2], c=domain_labels)
-        plt.title("T-SNE Digits")
-        plt.savefig(domain + "_new_30_epoch_" + "T-SNE_Digits_3d.png")
-    else:
-        print("The value of n_components can only be 2 or 3")
+# 中心点约束，同域中不同class的数据尽量拉开
+# 采用hinge loss，同域之间拉开但是要看得出来这是同一个域的数据
+# 注意每次都是对一个batch中的数据进行处理(一开始时这么做)
+def center_point_constraint(F_d_features, targets):
+    negative_features = None
+    positive_features = None
+    for i in range(targets.shape[0]):
+        F_d_features_i = torch.unsqueeze(F_d_features[i], 0)
+        if targets[i].item() == 0:
+            if negative_features is None:
+                negative_features = F_d_features_i
+            else:
+                negative_features = torch.cat([negative_features, F_d_features_i], 0)
+        else:
+            if positive_features is None:
+                positive_features = F_d_features_i
+            else:
+                positive_features = torch.cat([positive_features, F_d_features_i], 0)
 
+    print(F_d_features.shape)
+    print(negative_features.shape)
+    print(positive_features.shape)
+
+    negative_features_center = torch.sum(negative_features, 0) / negative_features.shape[0]
+    positive_features_center = torch.sum(positive_features, 0) / positive_features.shape[0]
+
+    # 先用平方loss试试看
+    norm_loss = torch.norm(negative_features_center - positive_features_center, p=2)
+    return norm_loss
+# 这个约束项先不加，它的目的是尽量缩小源域和目标域中，同一类的sample的差异
+# 但是没有target domain的特征提取器，因此先缩小源域
+# 而源域有多个，若双重for循环一一暴力匹配，则为平方复杂度
+# 因此这个约束项暂时不加
+def cluster_alignment_regularization():
+    pass
+
+
+def scatter(x, colors, species_number):
+    # We choose a color palette with seaborn.
+    palette = np.array(sns.color_palette("hls", species_number))
+
+    # We create a scatter plot.
+    f = plt.figure(figsize=(16, 16))
+    ax = plt.subplot(aspect='equal')
+    sc = ax.scatter(x[:,0], x[:,1], lw=0, s=40,
+                    c=palette[colors.astype(np.int)])
+    plt.xlim(-25, 25)
+    plt.ylim(-25, 25)
+    ax.axis('off')
+    ax.axis('tight')
+
+    return f, ax, sc
+
+
+def t_sne(domain, visual_features, senti_labels, species_number):
+    compressed_visual_features = TSNE(random_state=2019).fit_transform(visual_features)
+    scatter(compressed_visual_features, senti_labels, species_number)
+    plt.savefig(domain + "digits_tsne-generated.png", dpi=120)
     plt.show()
 
 
 def main():
-    if not os.path.exists(opt.exp2_model_save_file):
-        os.makedirs(opt.exp2_model_save_file)
-
     unlabeled_domains = ['books', 'dvd', 'electronics', 'kitchen']
     test_acc_dict = {}
     i = 1
+    opt.shared_lambd = 0.025
+    opt.private_lambd = 0.025
+
     ave_acc = 0.0
     for domain in unlabeled_domains:
         opt.domains = ['books', 'dvd', 'electronics', 'kitchen']
@@ -466,9 +550,9 @@ def main():
             test_sets[domain] = raw_unlabeled_sets[domain]
             unlabeled_sets[domain] = datasets[domain]
 
-        cv, visual_features, domain_labels = train(train_sets, dev_sets, test_sets, unlabeled_sets)
+        cv, visual_features, senti_labels = train(train_sets, dev_sets, test_sets, unlabeled_sets)
         print(visual_features.shape)
-        print(domain_labels.shape)
+        print(senti_labels.shape)
         log.info(f'Training done...')
         acc = sum(cv['valid'].values()) / len(cv['valid'])
         log.info(f'Validation Set Domain Average\t{acc}')
@@ -478,17 +562,12 @@ def main():
         i += 1
 
         # ---------------------- 可视化 ---------------------- #
-        # log.info(f'feature visualization')
-        #
-        # print("Computing t-SNE 2D embedding")
-        # t0 = time()
-        # t_sne(domain, 2, visual_features.detach().cpu().numpy(), domain_labels.detach().cpu().numpy())
-        # print("t-SNE 2D embedding of the digits (time %.2fs)" % (time() - t0))
+        log.info(f'feature visualization')
 
-        # print("Computing t-SNE 3D embedding")
-        # t0 = time()
-        # t_sne(domain, 3, visual_features.detach().cpu().numpy(), domain_labels.detach().cpu().numpy())
-        # print("t-SNE 3D embedding of the digits (time %.2fs)" % (time() - t0))
+        print("Computing t-SNE 2D embedding")
+        t0 = time()
+        t_sne(domain, visual_features.detach().cpu().numpy(), senti_labels.detach().cpu().numpy(), len(opt.domains) + 1)
+        print("t-SNE 2D embedding of the digits (time %.2fs)" % (time() - t0))
 
     log.info(f'Training done...')
     log.info(f'test_acc\'s result is: ')

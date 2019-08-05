@@ -28,7 +28,7 @@ parser.add_argument('--exp2_model_save_file', default='./save/man_exp2/exp1')
 parser.add_argument('--exp3_model_save_file', default='./save/man_exp3')
 
 parser.add_argument('--test_only', dest='test_only', action='store_true')
-parser.add_argument('--batch_size', type=int, default=8)
+parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--learning_rate', type=float, default=0.0001)
 parser.add_argument('--D_learning_rate', type=float, default=0.0001)
 parser.add_argument('--fix_emb', action='store_true', default=False)
@@ -54,7 +54,7 @@ parser.add_argument('--F_hidden_sizes', type=int, nargs='+', default=[1000, 500]
 # it's nearly equivalent to the GR (NLL) loss
 parser.add_argument('--loss', default='gr')
 parser.add_argument('--shared_hidden_size', type=int, default=128)
-parser.add_argument('--domain_hidden_size', type=int, default=128)
+parser.add_argument('--domain_hidden_size', type=int, default=1024)
 parser.add_argument('--activation', default='relu') # relu, leaky
 parser.add_argument('--F_layers', type=int, default=1)
 parser.add_argument('--C_layers', type=int, default=1)

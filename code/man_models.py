@@ -165,7 +165,7 @@ class MlpFeatureExtractor(nn.Module):
         self.net.add_module('f-linear-final', nn.Linear(hidden_sizes[-1], output_size))
         if batch_norm:
             self.net.add_module('f-bn-final', nn.BatchNorm1d(output_size))
-        self.net.add_module('f-relu-final', opt.act_unit)
+        # self.net.add_module('f-relu-final', opt.act_unit)
 
     def forward(self, input):
         return self.net(input)
