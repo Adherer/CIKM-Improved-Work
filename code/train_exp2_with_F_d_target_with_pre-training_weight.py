@@ -1,6 +1,7 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 import logging
 import random
-import os
 import sys
 from tqdm import tqdm
 import torch.optim as optim
@@ -14,7 +15,6 @@ from utils import *
 from amazon_subset import Subset
 
 # ---------------------- some settings ---------------------- #
-os.environ["CUDA_VISIBLE_DEVICES"] = "6"
 random.seed(opt.random_seed)
 np.random.seed(opt.random_seed)
 torch.manual_seed(opt.random_seed)
@@ -32,11 +32,16 @@ log.addHandler(fh)
 log.info(opt)
 # ---------------------- some settings ---------------------- #
 
+# ---------------------- 这边遇到的问题：label预测的准确率很低，只有50%不到的label预测正确了，所以这时候应该思考一下问题可能出在哪个环节 ---------------------- #
 
 # ---------------------- training ---------------------- #
-def train(target_domain_idx, train_sets, test_sets):
+def train(target_domain_idx, unlabeled_sets, test_sets):
     """
-    train_sets, test_sets: unlabeled domain(dev domain) -> AmazonDataset
+    :param target_domain_idx: target domain的index
+    :param train_sets: 用于送入Sentiment Classifier和Domain Classifier的数据集
+    :param unlabeled_sets: 需要产生伪label的数据集，只能通过公有特征提取器提取特征
+    :param test_sets: 测试集，测试最后整个模型预测的准确率
+    :return:
     """
     # test dataset
     print(train_sets[0])
@@ -44,9 +49,20 @@ def train(target_domain_idx, train_sets, test_sets):
     print(train_sets[0][0].shape)
     print(test_sets[0][1].shape)
 
+    # ---------------------- dataset loaders & dataset iters ---------------------- #
+    train_loaders, unlabeled_loaders, test_loaders = {}, {}, {}
+
     # ---------------------- dataloader ---------------------- #
-    train_loaders = DataLoader(train_sets, opt.batch_size, shuffle=False)
-    test_loaders = DataLoader(test_sets, opt.batch_size, shuffle=False)
+    for domain in opt.domains:
+        train_loaders[domain] = DataLoader(train_sets[domain],
+                                           opt.batch_size, shuffle=True)
+        # train_iters[domain] = iter(train_loaders[domain])
+
+    for domain in opt.dev_domains:
+        unlabeled_loaders[domain] = DataLoader(unlabeled_sets[domain],
+                                               opt.batch_size, shuffle=False)
+        test_loaders[domain] = DataLoader(test_sets[domain],
+                                          opt.batch_size, shuffle=False)
 
     # ---------------------- model initialization ---------------------- #
     F_s = None
@@ -86,11 +102,17 @@ def train(target_domain_idx, train_sets, test_sets):
                                               f'netD.pth')))
 
     # ---------------------- get fake label(hard label) ---------------------- #
+    # ---------------------- 不断迭代，直到label预测的正确率到了指定阈值 ---------------------- #
     log.info('Get fake label:')
-    pseudo_labels, _ = genarate_labels(target_domain_idx, False, train_loaders, F_s, F_d, C, D)
+    label_correct_acc, label_predict_acc_threshold = 0.0, 0.8
+    while label_correct_acc < label_predict_acc_threshold:
+        pseudo_labels, targets_total = genarate_labels(target_domain_idx, False,
+                                                       train_loaders, unlabeled_loaders, F_s, F_d, C, D)
+        label_correct_acc = calc_label_prediction(pseudo_labels, targets_total)
 
     # ********************** Test the accuracy of the label prediction ********************** #
-    test_pseudo_labels, targets_total = genarate_labels(target_domain_idx, True, test_loaders, F_s, F_d, C, D)
+    test_pseudo_labels, targets_total = genarate_labels(target_domain_idx, True,
+                                                        train_loaders, test_loaders, F_s, F_d, C, D)
     label_correct_acc = calc_label_prediction(test_pseudo_labels, targets_total)
     log.info(f'the correct rate of label prediction: {label_correct_acc}')
     # ********************** Test the accuracy of the label prediction ********************** #
@@ -224,7 +246,7 @@ def train_D(target_domain_idx, optimizerD, F_d_features, shared_feature, D):
     optimizerD.step()
 
 
-def genarate_labels(target_domain_idx, test_for_label_acc, dataloader, F_s, F_d, C, D):
+def genarate_labels(target_domain_idx, test_for_label_acc, train_loaders, unlabeled_loaders, F_s, F_d, C, D):
     """Genrate pseudo labels for unlabeled domain dataset."""
     # ---------------------- Switch to eval() mode ---------------------- #
     optimizerD = optim.Adam(D.parameters(), lr=opt.D_learning_rate)
@@ -305,6 +327,27 @@ def genarate_labels(target_domain_idx, test_for_label_acc, dataloader, F_s, F_d,
             pred_scores = torch.cat([even_index_scores_sum, odd_index_scores_sum], 1)
             _, pred_idx = torch.max(pred_scores, 1)
 
+            # ---------------------- 利用得到的label训练C和F_d & F_s ---------------------- #
+            # F&C iteration
+            utils.unfreeze_net(F_s)
+            map(utils.unfreeze_net, F_d.values())
+            utils.unfreeze_net(C)
+            utils.freeze_net(D)
+            F_s.zero_grad()
+            for f_d in F_d.values():
+                f_d.zero_grad()
+            C.zero_grad()
+            for domain in opt.domains:
+                targets = targets.to(opt.device)
+                shared_feat = F_s(inputs)
+                domain_feat = F_d[domain](inputs)
+                features = torch.cat((shared_feat, domain_feat), dim=1)
+                c_outputs = C(features)
+                l_c = functional.nll_loss(c_outputs, )
+                l_c.backward(retain_graph=True)
+                _, pred = torch.max(c_outputs, 1)
+                total[domain] += targets.size(0)
+                correct[domain] += (pred == targets).sum().item()
             # ---------------------- 保存pseudo_labels ---------------------- #
             if pseudo_labels is None:
                 pseudo_labels = pred_idx
@@ -360,26 +403,58 @@ def calc_label_prediction(test_pseudo_labels, targets_total):
     return equal_idx.shape[0] / test_pseudo_labels.shape[0]
 
 
+# 写这一部分代码需要注意的一个问题：
+# 1.因为是two-stage的训练，因此不再需要每个私有特征提取器所对应的训练数据，并且也不需要他们这些域的无标签数据
+# 2.只需要unlabeled(dev) domain所对应的dataset的数据以及raw_unlabeled_sets这一部分的数据，其中
+#   raw_unlabeled_sets这一部分的数据，要来打伪标签，而dataset这一部分的数据由于有标签，因为其用来测试模型的准确率
+#   实际上看效果，如果效果可以的话，二者的功能可以颠倒
+# 3.另外在这个阶段，怎么更新C也是一个大问题(实际上由于是无监督训练，理论上无法再通过label有监督的更新C)，明天再好好想想
 def main():
-    if not os.path.exists(opt.exp2_model_save_file):
-        os.makedirs(opt.exp2_model_save_file)
 
     unlabeled_domains = ['books', 'dvd', 'electronics', 'kitchen']
     test_acc_dict = {}
     i = 1
     ave_acc = 0.0
+
     # unlabeled samples as train_sets, labeled samples as test_sets
     for domain in unlabeled_domains:
+
+        # ---------------------- 一些参数的设置 ---------------------- #
         opt.domains = ['books', 'dvd', 'electronics', 'kitchen']
-        # unlabeled samples as train_sets, labeled samples as test_sets
-        test_sets, train_sets = get_msda_amazon_datasets(
-            opt.prep_amazon_file, domain, 1, opt.feature_num)
         opt.num_labels = 2
-        opt.unlabeled_domains = domain
-        opt.dev_domains = domain
+        opt.unlabeled_domains = domain.split()
+        opt.dev_domains = domain.split()
         opt.domains.remove(domain)
         opt.exp2_model_save_file = './save/man_exp2/exp' + str(i)
-        test_acc = train(i - 1, train_sets, test_sets)          # i表示target domain的index
+        if not os.path.exists(opt.exp2_model_save_file):
+            os.makedirs(opt.exp2_model_save_file)
+
+        # ---------------------- 加载数据集 ---------------------- #
+        datasets = {}
+        raw_unlabeled_sets = {}
+
+        # ---------------------- unlabeled domain(target domain) ---------------------- #
+        for domain in opt.opt.dev_domains:
+            datasets[domain], raw_unlabeled_sets[domain] = get_msda_amazon_datasets(
+                opt.prep_amazon_file, domain, 1, opt.feature_num)
+        opt.num_labels = 2
+        log.info(f'Done Loading {opt.dataset} Datasets.')
+        log.info(f'Domains: {opt.domains}')
+
+        # ---------------------- 数据集的设置 ---------------------- #
+        train_sets, dev_sets, test_sets, unlabeled_sets = {}, {}, {}, {}
+        # 这一部分domain的数据都有私有特征提取器
+        for domain in opt.domains:
+            train_sets[domain] = datasets[domain]
+
+        # ---------------------- 这一部分domain的数据没有私有特征提取器，只能通过公有特征提取器提取特征 ---------------------- #
+        # ---------------------- 送入D训练的部分是dev_sets的部分，而test_sets是raw_unlabeled_sets的部分 ---------------------- #
+        for domain in opt.dev_domains:
+            unlabeled_sets[domain] = datasets[domain]
+            test_sets[domain] = raw_unlabeled_sets[domain]
+
+        # ---------------------- 训练产生伪label和F_d_target的过程 ---------------------- #
+        test_acc = train(i - 1, train_sets, unlabeled_sets, test_sets)          # i表示target domain的index
         test_acc_dict[domain] = test_acc
         i += 1
 

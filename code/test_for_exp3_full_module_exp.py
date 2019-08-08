@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"
 from collections import defaultdict
 import itertools
 import logging
@@ -7,79 +7,60 @@ import pickle
 import random
 import sys
 from tqdm import tqdm
+
 import numpy as np
+import torch
 import torch.optim as optim
 from torch.utils.data import ConcatDataset, DataLoader
 from torchnet.meter import ConfusionMeter
-from data_prep.msda_preprocessed_amazon_dataset import get_msda_amazon_datasets
-from man_models import *
-import utils
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from mpl_toolkits.mplot3d import Axes3D
-from time import time
-from tensorboardX import SummaryWriter
 
-# ---------------------- 2019.07.26更新 ---------------------- #
-# 1.加上网格搜索，注意看哪些参数是需要网格搜索完成的，另外注意控制变量法来搜索参数
-# 2.加上tensorboardX可视化loss变化情况，主要看private feature和shared feature经过判别器之后的loss变化情况
-#   以及Classifier的loss
-# ---------------------- 2019.07.26更新 ---------------------- #
-
-
-# ---------------------- 最小化实验的简单思路 ---------------------- #
-# 由于师兄设计的模型比较复杂，可能需要再进一步思考收敛策略，因此将实验最小化，争取先调出D
-# 调出D的意思就是，争取让各个F_d都分开，并且F_s与各个F_d之间均有重叠，可以利用t-SNE进行可视化操作
-# 注意D网络架构的设计，可以继续探索，加梯度惩罚或者信息瓶颈等都试试看
-# 以下是训练的一些细节：
-# 首先要加载所有的数据，初步选定的训练方式是：
-# 1.每个domain对应于一个dataloader，每个E_p喂入batch_size的数据，并将(len(domains) * batch_size)送入E_s
-# 2.需要注意的是，训练方式跟MAN中的一致，只不过在两个domain loss处，要加上F_d的部分
-
-
-# ---------------------- some settings ---------------------- #
+from options import opt
 random.seed(opt.random_seed)
 np.random.seed(opt.random_seed)
 torch.manual_seed(opt.random_seed)
 torch.cuda.manual_seed_all(opt.random_seed)
 
+from data_prep.fdu_mtl_dataset import get_fdu_mtl_datasets, FduMtlDataset
+from man_models import *
+from man_vocab import Vocab
+import utils
+from time import time
+import torch.nn.functional as F
+from sklearn.manifold import TSNE
+import seaborn as sns
+import matplotlib.pyplot as plt
+import pandas as pd
+
 # save model and logging
-if not os.path.exists(opt.exp2_target_model_save_file):
-    os.makedirs(opt.exp2_target_model_save_file)
+if not os.path.exists(opt.exp3_model_save_file):
+    os.makedirs(opt.exp3_model_save_file)
 logging.basicConfig(stream=sys.stderr, level=logging.DEBUG if opt.debug else logging.INFO)
 log = logging.getLogger(__name__)
-fh = logging.FileHandler(os.path.join(opt.exp2_target_model_save_file, '2019.07.08_exp2_log.txt'))
+fh = logging.FileHandler(os.path.join(opt.exp3_model_save_file, 'log.txt'))
 log.addHandler(fh)
-
 # output options
 log.info(opt)
-# ---------------------- some settings ---------------------- #
 
 
-# ---------------------- training ---------------------- #
-def train(train_sets, dev_sets, test_sets, unlabeled_sets):
+def train(vocab, train_sets, dev_sets, test_sets, unlabeled_sets):
     """
     train_sets, dev_sets, test_sets: dict[domain] -> AmazonDataset
     For unlabeled domains, no train_sets are available
     """
-
-    # ---------------------- dataloader ---------------------- #
     # dataset loaders
     train_loaders, unlabeled_loaders = {}, {}
     train_iters, unlabeled_iters = {}, {}
     dev_loaders, test_loaders = {}, {}
-    # 加载有label的训练数据
+    my_collate = utils.sorted_collate if opt.model=='lstm' else utils.unsorted_collate
     for domain in opt.domains:
         train_loaders[domain] = DataLoader(train_sets[domain],
-                                           opt.batch_size, shuffle=True)
+                opt.batch_size, shuffle=True, collate_fn=my_collate)
         train_iters[domain] = iter(train_loaders[domain])
-
     for domain in opt.dev_domains:
         dev_loaders[domain] = DataLoader(dev_sets[domain],
-                                         opt.batch_size, shuffle=False)
+                opt.batch_size, shuffle=False, collate_fn=my_collate)
         test_loaders[domain] = DataLoader(test_sets[domain],
-                                          opt.batch_size, shuffle=False)
-
+                opt.batch_size, shuffle=False, collate_fn=my_collate)
     for domain in opt.all_domains:
         if domain in opt.unlabeled_domains:
             uset = unlabeled_sets[domain]
@@ -94,44 +75,88 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             else:
                 raise Exception(f'Unknown options for the unlabeled data usage: {opt.unlabeled_data}')
         unlabeled_loaders[domain] = DataLoader(uset,
-                opt.batch_size, shuffle=True)
+                opt.batch_size, shuffle=True, collate_fn = my_collate)
         unlabeled_iters[domain] = iter(unlabeled_loaders[domain])
 
-    # ---------------------- model initialization ---------------------- #
+    # model
     F_s = None
     F_d = {}
-    C = None
-    if opt.model.lower() == 'mlp':
-        F_s = MlpFeatureExtractor(opt.feature_num, opt.F_hidden_sizes,
-                opt.shared_hidden_size, opt.dropout, opt.F_bn)
+    C, D = None, None
+    if opt.model.lower() == 'dan':
+        F_s = DanFeatureExtractor(vocab, opt.F_layers, opt.shared_hidden_size,
+                               opt.sum_pooling, opt.dropout, opt.F_bn)
         for domain in opt.domains:
-            F_d[domain] = MlpFeatureExtractor(opt.feature_num, opt.F_hidden_sizes,
-                opt.domain_hidden_size, opt.dropout, opt.F_bn)
+            F_d[domain] = DanFeatureExtractor(vocab, opt.F_layers, opt.domain_hidden_size,
+                                           opt.sum_pooling, opt.dropout, opt.F_bn)
+    elif opt.model.lower() == 'lstm':
+        F_s = LSTMFeatureExtractor(vocab, opt.F_layers, opt.shared_hidden_size,
+                                   opt.dropout, opt.bdrnn, opt.attn)
+        for domain in opt.domains:
+            F_d[domain] = LSTMFeatureExtractor(vocab, opt.F_layers, opt.domain_hidden_size,
+                                               opt.dropout, opt.bdrnn, opt.attn)
+    elif opt.model.lower() == 'cnn':
+        F_s = CNNFeatureExtractor(vocab, opt.F_layers, opt.shared_hidden_size,
+                                  opt.kernel_num, opt.kernel_sizes, opt.dropout)
+        for domain in opt.domains:
+            F_d[domain] = CNNFeatureExtractor(vocab, opt.F_layers, opt.domain_hidden_size,
+                                              opt.kernel_num, opt.kernel_sizes, opt.dropout)
     else:
         raise Exception(f'Unknown model architecture {opt.model}')
 
     C = SentimentClassifier(opt.C_layers, opt.shared_hidden_size + opt.domain_hidden_size,
-                            opt.shared_hidden_size + opt.domain_hidden_size, opt.num_labels,
-                            opt.dropout, opt.C_bn)
+            opt.shared_hidden_size + opt.domain_hidden_size, opt.num_labels,
+            opt.dropout, opt.C_bn)
     D = DomainClassifier(opt.D_layers, opt.shared_hidden_size, opt.shared_hidden_size,
                          len(opt.all_domains), opt.loss, opt.dropout, opt.D_bn)
 
-    # 转移到gpu上
     F_s, C, D = F_s.to(opt.device), C.to(opt.device), D.to(opt.device)
     for f_d in F_d.values():
         f_d = f_d.to(opt.device)
-
-    optimizer = optim.Adam(itertools.chain(*map(list, [F_s.parameters() if F_s else [], C.parameters()] + [f.parameters() for f in F_d.values()])),
-                           lr=opt.learning_rate)
+    # optimizers
+    optimizer = optim.Adam(itertools.chain(*map(list, [F_s.parameters() if F_s else [], C.parameters()] + [f.parameters() for f in F_d.values()])), lr=opt.learning_rate)
     optimizerD = optim.Adam(D.parameters(), lr=opt.D_learning_rate)
+
+    # testing
+    if opt.test_only:
+        log.info(f'Loading model from {opt.exp3_model_save_file}...')
+        if F_s:
+            F_s.load_state_dict(torch.load(os.path.join(opt.exp3_model_save_file,
+                                           f'netF_s.pth')))
+        for domain in opt.all_domains:
+            if domain in F_d:
+                F_d[domain].load_state_dict(torch.load(os.path.join(opt.exp3_model_save_file,
+                        f'net_F_d_{domain}.pth')))
+        C.load_state_dict(torch.load(os.path.join(opt.exp3_model_save_file,
+                                                  f'netC.pth')))
+        D.load_state_dict(torch.load(os.path.join(opt.exp3_model_save_file,
+                                                  f'netD.pth')))
+
+        log.info('Evaluating validation sets:')
+        acc = {}
+        for domain in opt.all_domains:
+            acc[domain] = evaluate(domain, dev_loaders[domain],
+                                   F_s, F_d[domain] if domain in F_d else None, C)
+        avg_acc = sum([acc[d] for d in opt.dev_domains]) / len(opt.dev_domains)
+        log.info(f'Average validation accuracy: {avg_acc}')
+        log.info('Evaluating test sets:')
+        test_acc = {}
+        for domain in opt.all_domains:
+            test_acc[domain] = evaluate(domain, test_loaders[domain],
+                    F_s, F_d[domain] if domain in F_d else None, C)
+        avg_test_acc = sum([test_acc[d] for d in opt.dev_domains]) / len(opt.dev_domains)
+        log.info(f'Average test accuracy: {avg_test_acc}')
+        return {'valid': acc, 'test': test_acc}
 
     # training
     best_acc, best_avg_acc = defaultdict(float), 0.0
-    # writer = SummaryWriter()
     for epoch in range(opt.max_epoch):
         F_s.train()
         C.train()
         D.train()
+        LAMBDA = 3
+        lambda1 = 0.1
+        lambda2 = 0.1
+
         for f in F_d.values():
             f.train()
 
@@ -152,7 +177,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             # ---------------------- update D with D gradients on all domains ---------------------- #
             n_critic = opt.n_critic
             if opt.wgan_trick:
-                if opt.n_critic > 0 and ((epoch == 0 and i < 25) or i % 500 == 0):
+                if opt.n_critic>0 and ((epoch==0 and i<25) or i%500==0):
                     n_critic = 100
 
             for _ in range(n_critic):
@@ -164,7 +189,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                     #                             unlabeled_loaders, unlabeled_iters, domain)
                     d_inputs, _ = utils.endless_get_next_batch(
                         unlabeled_loaders, unlabeled_iters, domain)
-                    d_targets = utils.get_domain_label(opt.loss, domain, len(d_inputs))
+                    d_targets = utils.get_domain_label(opt.loss, domain, len(d_inputs[1]))
                     shared_feat = F_s(d_inputs)
                     shared_d_outputs = D(shared_feat)
                     _, shared_pred = torch.max(shared_d_outputs, 1)
@@ -173,7 +198,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                         private_d_outputs = D(private_feat)
                         _, private_pred = torch.max(private_d_outputs, 1)
 
-                    d_total += len(d_inputs)
+                    d_total += len(d_inputs[1])
                     if opt.loss.lower() == 'l2':
                         _, tgt_indices = torch.max(d_targets, 1)
                         shared_d_correct += (shared_pred == tgt_indices).sum().item()
@@ -197,15 +222,21 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
 
                     loss_d[domain] = l_d_sum.item()
                 optimizerD.step()
+
             # ---------------------- update D with C gradients on all domains ---------------------- #
             # ********************** D iterations on all domains ********************** #
 
             # ********************** F&C iteration ********************** #
             # ---------------------- update F_s & F_ds with C gradients on all labeled domains ---------------------- #
+            # F&C iteration
             utils.unfreeze_net(F_s)
             map(utils.unfreeze_net, F_d.values())
             utils.unfreeze_net(C)
             utils.freeze_net(D)
+            if opt.fix_emb:
+                utils.freeze_net(F_s.word_emb)
+                for f_d in F_d.values():
+                    utils.freeze_net(f_d.word_emb)
             F_s.zero_grad()
             for f_d in F_d.values():
                 f_d.zero_grad()
@@ -218,7 +249,22 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                 domain_feat = F_d[domain](inputs)
                 features = torch.cat((shared_feat, domain_feat), dim=1)
                 c_outputs = C(features)
-                l_c = functional.nll_loss(c_outputs, targets)
+                loss_part_1 = functional.nll_loss(c_outputs, targets)
+
+                targets = targets.unsqueeze(1)
+                targets_onehot = torch.FloatTensor(opt.batch_size, 2)
+                targets_onehot.zero_()
+                targets_onehot.scatter_(1, targets.cpu(), 1)
+                targets_onehot = targets_onehot.to(opt.device)
+                loss_part_2 = lambda1 * margin_regularization(inputs, targets_onehot, F_d[domain], LAMBDA)
+
+                loss_part_3 = -lambda2 * center_point_constraint(domain_feat, targets)
+                print("lambda1: " + str(lambda1))
+                print("lambda2: " + str(lambda2))
+                print("loss_part_1: " + str(loss_part_1))
+                print("loss_part_2: " + str(loss_part_2))
+                print("loss_part_3: " + str(loss_part_3))
+                l_c = loss_part_1 + loss_part_2 + loss_part_3
                 l_c.backward(retain_graph=True)
                 _, pred = torch.max(c_outputs, 1)
                 total[domain] += targets.size(0)
@@ -226,9 +272,10 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             # ---------------------- update F_s & F_ds with C gradients on all labeled domains ---------------------- #
 
             # ---------------------- update F_s with D gradients on all domains ---------------------- #
+            # update F with D gradients on all domains
             for domain in opt.all_domains:
                 d_inputs, _ = utils.endless_get_next_batch(
-                    unlabeled_loaders, unlabeled_iters, domain)
+                        unlabeled_loaders, unlabeled_iters, domain)
                 shared_feat = F_s(d_inputs)
                 shared_d_outputs = D(shared_feat)
                 if domain != opt.dev_domains[0]:
@@ -237,7 +284,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
 
                 l_d_sum = None
                 if opt.loss.lower() == 'gr':
-                    d_targets = utils.get_domain_label(opt.loss, domain, len(d_inputs))
+                    d_targets = utils.get_domain_label(opt.loss, domain, len(d_inputs[1]))
                     shared_l_d = functional.nll_loss(shared_d_outputs, d_targets)
                     private_l_d, l_d_sum = 0.0, 0.0
                     if domain != opt.dev_domains[0]:
@@ -252,12 +299,12 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                     else:
                         l_d_sum += private_l_d * -1.
                 elif opt.loss.lower() == 'bs':
-                    d_targets = utils.get_random_domain_label(opt.loss, len(d_inputs))
+                    d_targets = utils.get_random_domain_label(opt.loss, len(d_inputs[1]))
                     shared_l_d = functional.kl_div(shared_d_outputs, d_targets, size_average=False)
                     private_l_d, l_d_sum = 0.0, 0.0
                     if domain != opt.dev_domains[0]:
-                        private_l_d = functional.kl_div(private_d_outputs, d_targets, size_average=False) * -1. / len(
-                            opt.domains)
+                        private_l_d = functional.kl_div(private_d_outputs, d_targets, size_average=False) \
+                                      * -1. / len(opt.domains)
                     if opt.shared_lambd > 0:
                         l_d_sum = shared_l_d * opt.shared_lambd
                     else:
@@ -267,7 +314,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                     else:
                         l_d_sum += private_l_d
                 elif opt.loss.lower() == 'l2':
-                    d_targets = utils.get_random_domain_label(opt.loss, len(d_inputs))
+                    d_targets = utils.get_random_domain_label(opt.loss, len(d_inputs[1]))
                     shared_l_d = functional.mse_loss(shared_d_outputs, d_targets)
                     private_l_d, l_d_sum = 0.0, 0.0
                     if domain != opt.dev_domains[0]:
@@ -281,13 +328,10 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                     else:
                         l_d_sum += private_l_d
                 l_d_sum.backward()
-            # ---------------------- update F_s with D gradients on all domains ---------------------- #
 
             optimizer.step()
-            # ********************** F&C iteration ********************** #
+
         # end of epoch
-        # writer.add_scalar('train/classifier-loss', l_c, epoch)
-        # writer.add_scalars('train/shared-private-loss', {'shared': shared_l_d, 'private': private_l_d}, epoch)
         log.info('Ending epoch {}'.format(epoch + 1))
         if d_total > 0:
             log.info('shared D Training Accuracy: {}%'.format(100.0 * shared_d_correct / d_total))
@@ -297,7 +341,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
         log.info('\t'.join(opt.domains))
         log.info('\t'.join([str(100.0 * correct[d] / total[d]) for d in opt.domains]))
 
-        # 训练过程中的验证集
+        # 验证集上验证实验
         log.info('Evaluating validation sets:')
         acc = {}
         for domain in opt.dev_domains:
@@ -306,7 +350,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
         avg_acc = sum([acc[d] for d in opt.dev_domains]) / len(opt.dev_domains)
         log.info(f'Average validation accuracy: {avg_acc}')
 
-        # 训练过程中的测试集
+        # 测试集上验证实验
         log.info('Evaluating test sets:')
         test_acc = {}
         for domain in opt.dev_domains:
@@ -315,65 +359,98 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
         avg_test_acc = sum([test_acc[d] for d in opt.dev_domains]) / len(opt.dev_domains)
         log.info(f'Average test accuracy: {avg_test_acc}')
 
+        # 保存模型
         if avg_acc > best_avg_acc:
             log.info(f'New best average validation accuracy: {avg_acc}')
             best_acc['valid'] = acc
             best_acc['test'] = test_acc
             best_avg_acc = avg_acc
-            with open(os.path.join(opt.exp2_model_save_file, 'options.pkl'), 'wb') as ouf:
+            with open(os.path.join(opt.exp3_model_save_file, 'options.pkl'), 'wb') as ouf:
                 pickle.dump(opt, ouf)
             torch.save(F_s.state_dict(),
-                       '{}/netF_s.pth'.format(opt.exp2_model_save_file))
+                       '{}/netF_s.pth'.format(opt.exp3_model_save_file))
             for d in opt.domains:
                 if d in F_d:
                     torch.save(F_d[d].state_dict(),
-                               '{}/net_F_d_{}.pth'.format(opt.exp2_model_save_file, d))
+                               '{}/net_F_d_{}.pth'.format(opt.exp3_model_save_file, d))
             torch.save(C.state_dict(),
-                       '{}/netC.pth'.format(opt.exp2_model_save_file))
+                       '{}/netC.pth'.format(opt.exp3_model_save_file))
             torch.save(D.state_dict(),
-                       '{}/netD.pth'.format(opt.exp2_model_save_file))
-
+                    '{}/netD.pth'.format(opt.exp3_model_save_file))
 
     # end of training
-    # log.info(f'Best average validation accuracy: {best_avg_acc}')
-    #
-    # log.info(f'Loading model for feature visualization from {opt.exp2_model_save_file}...')
-    # F_s.load_state_dict(torch.load(os.path.join(opt.exp2_model_save_file,
-    #                                             f'netF_s.pth')))
-    # for domain in opt.domains:
-    #     F_d[domain].load_state_dict(torch.load(os.path.join(opt.exp2_model_save_file,
-    #                                                         f'net_F_d_{domain}.pth')))
-    # num_iter = len(train_loaders[opt.domains[0]])
-    # visual_features, domain_labels = get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_s, F_d)
-    return best_acc
+    log.info(f'Best average validation accuracy: {best_avg_acc}')
+
+    log.info(f'Loading model for feature visualization from {opt.exp3_model_save_file}...')
+
+    for domain in opt.domains:
+        F_d[domain].load_state_dict(torch.load(os.path.join(opt.exp3_model_save_file,
+                                                            f'net_F_d_{domain}.pth')))
+    num_iter = len(train_loaders[opt.domains[0]])
+    # visual_features暂时不加上shared feature
+    # visual_features, senti_labels = get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_s, F_d)
+    visual_features, senti_labels = get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_d)
+    return best_acc, visual_features, senti_labels
 
 
-def get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_s, F_d):
-    visual_features = None
-    domain_labels = None
-    for _ in tqdm(range(num_iter)):
-        for domain in opt.all_domains:
-            d_inputs, _ = utils.endless_get_next_batch(
-                unlabeled_loaders, unlabeled_iters, domain)
-            d_targets = utils.get_domain_label(opt.loss, domain, len(d_inputs))
-            if domain != opt.dev_domains[0]:
+def get_visual_features(num_iter, test_loaders, test_iters, F_d):
+    visual_features, senti_labels = None, None
+    with torch.no_grad():
+        for _ in tqdm(range(num_iter)):
+            for domain in opt.domains:
+                d_inputs, targets = utils.endless_get_next_batch(
+                    test_loaders, test_iters, domain)
                 private_features = F_d[domain](d_inputs)
-            shared_features = F_s(d_inputs)
-            if visual_features is None:
-                if domain != opt.dev_domains[0]:
-                    visual_features = torch.cat([private_features, shared_features], 0)
-                    domain_labels = torch.cat([d_targets, d_targets], 0)
+                if visual_features is None:
+                    visual_features = private_features
+                    senti_labels = targets
                 else:
-                    visual_features = shared_features
-                    domain_labels = d_targets
+                    visual_features = torch.cat([visual_features, private_features], 0)
+                    senti_labels = torch.cat([senti_labels, targets], 0)
+
+    return visual_features, senti_labels
+
+
+def margin_regularization(inputs, targets, F_d, LAMBDA):
+    features = F_d(inputs)
+    graph_source = torch.sum(targets[:, None, :] * targets[None, :, :], 2)
+    distance_source = torch.mean((features[:, None, :] - features[None, :, :]) ** 2, 2)
+    margin_loss = torch.mean(graph_source * distance_source + (1-graph_source)*F.relu(LAMBDA - distance_source))
+    return margin_loss
+
+
+# 中心点约束，同域中不同class的数据尽量拉开
+# 采用hinge loss，同域之间拉开但是要看得出来这是同一个域的数据
+# 注意每次都是对一个batch中的数据进行处理(一开始时这么做)
+def center_point_constraint(F_d_features, targets):
+
+    negative_features = None
+    positive_features = None
+    for i in range(targets.shape[0]):
+        F_d_features_i = torch.unsqueeze(F_d_features[i], 0)
+        if targets[i].item() == 0:
+            if negative_features is None:
+                negative_features = F_d_features_i
             else:
-                if domain != opt.dev_domains[0]:
-                    visual_features = torch.cat([visual_features, private_features, shared_features], 0)
-                    domain_labels = torch.cat([domain_labels, d_targets, d_targets], 0)
-                else:
-                    visual_features = torch.cat([visual_features, shared_features], 0)
-                    domain_labels = torch.cat([domain_labels, d_targets], 0)
-    return visual_features, domain_labels
+                negative_features = torch.cat([negative_features, F_d_features_i], 0)
+        else:
+            if positive_features is None:
+                positive_features = F_d_features_i
+            else:
+                positive_features = torch.cat([positive_features, F_d_features_i], 0)
+
+    print(F_d_features.shape)
+    print(negative_features.shape)
+    print(positive_features.shape)
+
+    negative_features_center = torch.sum(negative_features, 0) / negative_features.shape[0]
+    positive_features_center = torch.sum(positive_features, 0) / positive_features.shape[0]
+
+    # 求和后取平均版本
+    center_loss = torch.mean(torch.sum(torch.pow(negative_features_center - positive_features_center, 2)))
+    # 求和后不取平均版本
+    # center_loss = torch.sum(torch.pow(negative_features_center - positive_features_center, 2))
+    return center_loss
 
 
 def evaluate(name, loader, F_s, F_d, C):
@@ -386,6 +463,7 @@ def evaluate(name, loader, F_s, F_d, C):
     total = 0
     confusion = ConfusionMeter(opt.num_labels)
     for inputs, targets in tqdm(it):
+        # print(type(inputs))
         targets = targets.to(opt.device)
         if not F_d:
             # unlabeled domain
@@ -404,119 +482,59 @@ def evaluate(name, loader, F_s, F_d, C):
     return acc
 
 
-def plot_embedding(data):
-    x_min, x_max = np.min(data, 0), np.max(data, 0)
-    data = (data - x_min) / (x_max - x_min)
-    return data
+def scatter(data, label, dir, file_name, mus=None, mark_size=2):
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+
+    if label.ndim == 2:
+        label = np.argmax(label, axis=1)
+
+    df = pd.DataFrame(data={'x': data[:, 0], 'y': data[:, 1], 'class': label})
+    sns_plot = sns.lmplot('x', 'y', data=df, hue='class', fit_reg=False, scatter_kws={'s': mark_size})
+    sns_plot.savefig(os.path.join(dir, file_name))
+    if mus is not None:
+        df_mus = pd.DataFrame(
+            data={'x': mus[:, 0], 'y': mus[:, 1], 'class': np.asarray(range(mus.shape[0])).astype(np.int32)})
+        sns_plot_mus = sns.lmplot('x', 'y', data=df_mus, hue='class', fit_reg=False, scatter_kws={'s': mark_size * 20})
+        sns_plot_mus.savefig(os.path.join(dir, 'mus_' + file_name))
 
 
-def t_sne(domain, n_components, visual_features, domain_labels):
-    if n_components == 2:
-        tsne_features = TSNE(n_components=n_components, random_state=35).fit_transform(visual_features)
-        aim_data = plot_embedding(tsne_features)
-        print(aim_data.shape)
-        plt.figure()
-        plt.subplot(111)
-        plt.scatter(aim_data[:, 0], aim_data[:, 1], c=domain_labels)
-        plt.title("T-SNE Digits")
-        plt.savefig(domain + "_new_30_epoch_" + "T-SNE_Digits.png")
-    elif n_components == 3:
-        tsne_features = TSNE(n_components=n_components, random_state=35).fit_transform(visual_features)
-        aim_data = plot_embedding(tsne_features)
-        fig = plt.figure()
-        ax = Axes3D(fig)
-        ax.scatter(aim_data[:, 0], aim_data[:, 1], aim_data[:, 2], c=domain_labels)
-        plt.title("T-SNE Digits")
-        plt.savefig(domain + "_new_30_epoch_" + "T-SNE_Digits_3d.png")
-    else:
-        print("The value of n_components can only be 2 or 3")
-
+def t_sne(visual_features, senti_labels):
+    compressed_visual_features = TSNE(random_state=2019).fit_transform(visual_features)
+    scatter(data=compressed_visual_features, label=senti_labels,
+            dir="./result",
+            file_name="exp3_tsne-generated_image.png")
     plt.show()
 
 
 def main():
-    unlabeled_domains = ['books', 'dvd', 'electronics', 'kitchen']
-    test_acc_dict = {}
-    i = 1
-    result_dict = dict()
-    opt.batch_size = 64
-    for shared_lambd in [0.05, 0.025, 0.01]:
-        for private_lambd in [0.025, 0.01, 0.005]:
-            opt.shared_lambd = shared_lambd
-            opt.private_lambd = private_lambd
+    if not os.path.exists(opt.exp3_model_save_file):
+        os.makedirs(opt.exp3_model_save_file)
+    vocab = Vocab(opt.emb_filename)
+    log.info(f'Loading {opt.dataset} Datasets...')
+    log.info(f'Domains: {opt.domains}')
 
-            ave_acc = 0.0
-            for domain in unlabeled_domains:
-                opt.domains = ['books', 'dvd', 'electronics', 'kitchen']
-                opt.num_labels = 2
-                opt.unlabeled_domains = domain.split()
-                opt.dev_domains = domain.split()
-                opt.domains.remove(domain)
-                opt.exp2_model_save_file = './save/man_exp2/exp' + str(i)
-                if not os.path.exists(opt.exp2_model_save_file):
-                    os.makedirs(opt.exp2_model_save_file)
+    train_sets, dev_sets, test_sets, unlabeled_sets = {}, {}, {}, {}
+    for domain in opt.domains:
+        train_sets[domain], dev_sets[domain], test_sets[domain], unlabeled_sets[domain] = \
+            get_fdu_mtl_datasets(vocab, opt.fdu_mtl_dir, domain, opt.max_seq_len)
+    opt.num_labels = FduMtlDataset.num_labels
+    log.info(f'Done Loading {opt.dataset} Datasets.')
 
-                datasets = {}
-                raw_unlabeled_sets = {}
-                log.info(f'Loading {opt.dataset} Datasets...')
-                for domain in opt.all_domains:
-                    datasets[domain], raw_unlabeled_sets[domain] = get_msda_amazon_datasets(
-                        opt.prep_amazon_file, domain, 1, opt.feature_num)
-                opt.num_labels = 2
-                log.info(f'Done Loading {opt.dataset} Datasets.')
-                log.info(f'Domains: {opt.domains}')
-
-                train_sets, dev_sets, test_sets, unlabeled_sets = {}, {}, {}, {}
-                for domain in opt.domains:
-                    train_sets[domain] = datasets[domain]
-                    unlabeled_sets[domain] = raw_unlabeled_sets[domain]
-
-                # in this setting, dev_domains should only contain unlabeled domains
-                for domain in opt.dev_domains:
-                    dev_sets[domain] = datasets[domain]
-                    test_sets[domain] = raw_unlabeled_sets[domain]
-                    unlabeled_sets[domain] = datasets[domain]
-
-                cv = train(train_sets, dev_sets, test_sets, unlabeled_sets)
-                # print(visual_features.shape)
-                # print(domain_labels.shape)
-                log.info(f'Training done...')
-                acc = sum(cv['valid'].values()) / len(cv['valid'])
-                log.info(f'Validation Set Domain Average\t{acc}')
-                test_acc = sum(cv['test'].values()) / len(cv['test'])
-                log.info(f'Test Set Domain Average\t{test_acc}')
-                test_acc_dict[domain] = test_acc
-                i += 1
-
-            log.info(f'one pair training done...')
-            log.info(f'test_acc\'s result is: ')
-            for key in test_acc_dict:
-                log.info(str(key) + ": " + str(test_acc_dict[key]))
-                ave_acc += test_acc_dict[key]
-
-            log.info(f'ave_test_acc\'s result is: ')
-            log.info(ave_acc / 4)
-            result_dict[(shared_lambd, private_lambd)] = ave_acc / 4  # 保存结果
-        # ---------------------- 可视化 ---------------------- #
-        # log.info(f'feature visualization')
-        #
-        # print("Computing t-SNE 2D embedding")
-        # t0 = time()
-        # t_sne(domain, 2, visual_features.detach().cpu().numpy(), domain_labels.detach().cpu().numpy())
-        # print("t-SNE 2D embedding of the digits (time %.2fs)" % (time() - t0))
-
-        # print("Computing t-SNE 3D embedding")
-        # t0 = time()
-        # t_sne(domain, 3, visual_features.detach().cpu().numpy(), domain_labels.detach().cpu().numpy())
-        # print("t-SNE 3D embedding of the digits (time %.2fs)" % (time() - t0))
-
+    cv, visual_features, senti_labels = train(vocab, train_sets, dev_sets, test_sets, unlabeled_sets)
     log.info(f'Training done...')
-    log.info(f'The result is: ')
-    print(result_dict)
-    for key in result_dict:
-        log.info(str(key) + ": " + str(result_dict[key]))
+    acc = sum(cv['valid'].values()) / len(cv['valid'])
+    log.info(f'Validation Set Domain Average\t{acc}')
+    test_acc = sum(cv['test'].values()) / len(cv['test'])
+    log.info(f'Test Set Domain Average\t{test_acc}')
+
+    log.info(f'feature visualization')
+
+    print("Computing t-SNE 2D embedding")
+    t0 = time()
+    t_sne(visual_features.detach().cpu().numpy(), senti_labels.detach().cpu().numpy())
+    print("t-SNE 2D embedding of the digits (time %.2fs)" % (time() - t0))
 
 
 if __name__ == '__main__':
     main()
-

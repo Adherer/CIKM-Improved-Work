@@ -21,6 +21,10 @@ from tensorboardX import SummaryWriter
 import seaborn as sns
 import matplotlib.pyplot as plt
 import matplotlib.patheffects as PathEffects
+import torch.nn.functional as F
+import math
+import pandas as pd
+import tensorflow as tf
 
 # ---------------------- 2019.07.26更新 ---------------------- #
 # 1.加上网格搜索，注意看哪些参数是需要网格搜索完成的，另外注意控制变量法来搜索参数
@@ -203,9 +207,8 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             # ********************** D iterations on all domains ********************** #
 
             # ********************** F&C iteration ********************** #
-            # ---------------------- update F_s & F_ds with C gradients on all labeled domains ---------------------- #
-            lamda1 = 0.05
-            lamda2 = 0.2
+            # ---------------------- The first stage, update F_s & F_ds with C gradients ---------------------- #
+            # ---------------------- on all labeled domains ---------------------- #
             utils.unfreeze_net(F_s)
             map(utils.unfreeze_net, F_d.values())
             utils.unfreeze_net(C)
@@ -222,13 +225,7 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
                 domain_feat = F_d[domain](inputs)
                 features = torch.cat((shared_feat, domain_feat), dim=1)
                 c_outputs = C(features)
-                loss_part_1 = functional.nll_loss(c_outputs, targets)
-                loss_part_2 = lamda1 * margin_regularization(inputs, targets, F_d[domain])
-                loss_part_3 = - lamda2 * center_point_constraint(domain_feat, targets)
-                print("loss_part_1: " + str(loss_part_1))
-                print("loss_part_2: " + str(loss_part_2))
-                print("loss_part_3: " + str(loss_part_3))
-                l_c = loss_part_1 + loss_part_2 + loss_part_3
+                l_c = functional.nll_loss(c_outputs, targets)
                 l_c.backward(retain_graph=True)
                 _, pred = torch.max(c_outputs, 1)
                 total[domain] += targets.size(0)
@@ -296,8 +293,6 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             optimizer.step()
             # ********************** F&C iteration ********************** #
         # end of epoch
-        # writer.add_scalar('train/classifier-loss', l_c, epoch)
-        # writer.add_scalars('train/shared-private-loss', {'shared': shared_l_d, 'private': private_l_d}, epoch)
         log.info('Ending epoch {}'.format(epoch + 1))
         if d_total > 0:
             log.info('shared D Training Accuracy: {}%'.format(100.0 * shared_d_correct / d_total))
@@ -343,9 +338,95 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
             torch.save(D.state_dict(),
                        '{}/netD.pth'.format(opt.exp2_model_save_file))
 
+    # end of training C & D & F_s
+    log.info(f'Best average validation accuracy: {best_avg_acc}')
+
+    # ---------------------- The second stage, update F_ds with loss of two regular items ---------------------- #
+    # ---------------------- on all labeled domains ---------------------- #
+    correct, total = defaultdict(int), defaultdict(int)
+    for epoch in range(opt.max_epoch):
+        F_s.train()
+        C.train()
+        D.train()
+        for f in F_d.values():
+            f.train()
+        LAMBDA = 3
+        lambda1 = 0.05
+        lambda2 = 0.05
+        num_iter = len(train_loaders[opt.domains[0]])
+
+        for _ in tqdm(range(num_iter)):
+            utils.freeze_net(F_s)
+            map(utils.unfreeze_net, F_d.values())
+            utils.freeze_net(C)
+            utils.freeze_net(D)
+            for f_d in F_d.values():
+                f_d.zero_grad()
+
+            for domain in opt.domains:
+                inputs, targets = utils.endless_get_next_batch(
+                    train_loaders, train_iters, domain)
+                targets = targets.to(opt.device)
+                shared_feat = F_s(inputs)
+                domain_feat = F_d[domain](inputs)
+                features = torch.cat((shared_feat, domain_feat), dim=1)
+                c_outputs = C(features)
+
+                targets = targets.unsqueeze(1)
+                targets_onehot = torch.FloatTensor(opt.batch_size, 2)
+                targets_onehot.zero_()
+                targets_onehot.scatter_(1, targets.cpu(), 1)
+                targets_onehot = targets_onehot.to(opt.device)
+                regular_loss_part_1 = lambda1 * margin_regularization(inputs, targets_onehot, F_d[domain], LAMBDA)
+                regular_loss_part_2 = -lambda2 * center_point_constraint(domain_feat, targets)
+                print("regular_loss_part_1: " + str(regular_loss_part_1))
+                print("regular_loss_part_2: " + str(regular_loss_part_2))
+                l_c = regular_loss_part_1 + regular_loss_part_2
+                l_c.backward()
+                _, pred = torch.max(c_outputs, 1)
+                total[domain] += targets.size(0)
+                correct[domain] += (pred == targets).sum().item()
+
+            optimizer.step()
+
+        log.info('Ending epoch {}'.format(epoch + 1))
+        log.info('Training accuracy:')
+        log.info('\t'.join(opt.domains))
+        log.info('\t'.join([str(100.0 * correct[d] / total[d]) for d in opt.domains]))
+
+        # 训练过程中的验证集
+        log.info('Evaluating validation sets:')
+        acc = {}
+        for domain in opt.dev_domains:
+            acc[domain] = evaluate(domain, dev_loaders[domain],
+                                   F_s, F_d[domain] if domain in F_d else None, C)
+        avg_acc = sum([acc[d] for d in opt.dev_domains]) / len(opt.dev_domains)
+        log.info(f'Average validation accuracy: {avg_acc}')
+
+        # 训练过程中的测试集
+        log.info('Evaluating test sets:')
+        test_acc = {}
+        for domain in opt.dev_domains:
+            test_acc[domain] = evaluate(domain, test_loaders[domain],
+                                        F_s, F_d[domain] if domain in F_d else None, C)
+        avg_test_acc = sum([test_acc[d] for d in opt.dev_domains]) / len(opt.dev_domains)
+        log.info(f'Average test accuracy: {avg_test_acc}')
+
+        if avg_acc > best_avg_acc:
+            log.info(f'New best average validation accuracy: {avg_acc}')
+            best_acc['valid'] = acc
+            best_acc['test'] = test_acc
+            best_avg_acc = avg_acc
+            with open(os.path.join(opt.exp2_model_save_file, 'options.pkl'), 'wb') as ouf:
+                pickle.dump(opt, ouf)
+            for d in opt.domains:
+                if d in F_d:
+                    torch.save(F_d[d].state_dict(),
+                               '{}/net_F_d_{}.pth'.format(opt.exp2_model_save_file, d))
     # end of training
     log.info(f'Best average validation accuracy: {best_avg_acc}')
 
+    # ---------------------- 可视化 ---------------------- #
     log.info(f'Loading model for feature visualization from {opt.exp2_model_save_file}...')
     F_s.load_state_dict(torch.load(os.path.join(opt.exp2_model_save_file,
                                                 f'netF_s.pth')))
@@ -359,37 +440,55 @@ def train(train_sets, dev_sets, test_sets, unlabeled_sets):
     return best_acc, visual_features, senti_labels
 
 
-def get_visual_features(num_iter, unlabeled_loaders, unlabeled_iters, F_d):
-    negative_visual_features = None
-    positive_visual_features = None
-    negative_senti_labels = None
-    positive_senti_labels = None
-    for _ in tqdm(range(num_iter)):
-        for domain in opt.domains:
-            d_inputs, targets = utils.endless_get_next_batch(
-                unlabeled_loaders, unlabeled_iters, domain)
-            private_features = F_d[domain](d_inputs)
-            for i in range(targets.shape[0]):
-                targets_i = torch.unsqueeze(targets[i], 0)
-                private_features_i = torch.unsqueeze(private_features[i], 0)
-                if targets[i].item() == 0:
-                    if negative_visual_features is None:
-                        negative_visual_features = private_features_i
-                        negative_senti_labels = targets_i
-                    else:
-                        negative_visual_features = torch.cat([negative_visual_features, private_features_i], 0)
-                        negative_senti_labels = torch.cat([negative_senti_labels, targets_i], 0)
+def get_visual_features(num_iter, data_loaders, data_iters, F_d):
+    visual_features, senti_labels = None, None
+    with torch.no_grad():
+        for _ in tqdm(range(num_iter)):
+            for domain in opt.domains:
+                d_inputs, targets = utils.endless_get_next_batch(
+                    data_loaders, data_iters, domain)
+                private_features = F_d[domain](d_inputs)
+                if visual_features is None:
+                    visual_features = private_features
+                    senti_labels = targets
                 else:
-                    if positive_visual_features is None:
-                        positive_visual_features = private_features_i
-                        positive_senti_labels = targets_i
-                    else:
-                        positive_visual_features = torch.cat([positive_visual_features, private_features_i], 0)
-                        positive_senti_labels = torch.cat([positive_senti_labels, targets_i], 0)
+                    visual_features = torch.cat([visual_features, private_features], 0)
+                    senti_labels = torch.cat([senti_labels, targets], 0)
 
-    visual_features = torch.cat([negative_visual_features, positive_visual_features], 0)
-    senti_labels = torch.cat([negative_senti_labels, positive_senti_labels], 0)
     return visual_features, senti_labels
+
+
+# def get_visual_features(num_iter, data_loaders, data_iters, F_d):
+#     negative_visual_features = None
+#     positive_visual_features = None
+#     negative_senti_labels = None
+#     positive_senti_labels = None
+#     for _ in tqdm(range(num_iter)):
+#         for domain in opt.domains:
+#             d_inputs, targets = utils.endless_get_next_batch(
+#                 data_loaders, data_iters, domain)
+#             private_features = F_d[domain](d_inputs)
+#             for i in range(targets.shape[0]):
+#                 targets_i = torch.unsqueeze(targets[i], 0)
+#                 private_features_i = torch.unsqueeze(private_features[i], 0)
+#                 if targets[i].item() == 0:
+#                     if negative_visual_features is None:
+#                         negative_visual_features = private_features_i
+#                         negative_senti_labels = targets_i
+#                     else:
+#                         negative_visual_features = torch.cat([negative_visual_features, private_features_i], 0)
+#                         negative_senti_labels = torch.cat([negative_senti_labels, targets_i], 0)
+#                 else:
+#                     if positive_visual_features is None:
+#                         positive_visual_features = private_features_i
+#                         positive_senti_labels = targets_i
+#                     else:
+#                         positive_visual_features = torch.cat([positive_visual_features, private_features_i], 0)
+#                         positive_senti_labels = torch.cat([positive_senti_labels, targets_i], 0)
+#
+#     visual_features = torch.cat([negative_visual_features, positive_visual_features], 0)
+#     senti_labels = torch.cat([negative_senti_labels, positive_senti_labels], 0)
+#     return visual_features, senti_labels
 
 
 def evaluate(name, loader, F_s, F_d, C):
@@ -401,59 +500,98 @@ def evaluate(name, loader, F_s, F_d, C):
     correct = 0
     total = 0
     confusion = ConfusionMeter(opt.num_labels)
-    for inputs, targets in tqdm(it):
-        targets = targets.to(opt.device)
-        if not F_d:
-            # unlabeled domain
-            d_features = torch.zeros(len(targets), opt.domain_hidden_size).to(opt.device)
-        else:
-            d_features = F_d(inputs)
-        features = torch.cat((F_s(inputs), d_features), dim=1)
-        outputs = C(features)
-        _, pred = torch.max(outputs, 1)
-        confusion.add(pred.data, targets.data)
-        total += targets.size(0)
-        correct += (pred == targets).sum().item()
+    with torch.no_grad():
+        for inputs, targets in tqdm(it):
+            targets = targets.to(opt.device)
+            if not F_d:
+                # unlabeled domain
+                d_features = torch.zeros(len(targets), opt.domain_hidden_size).to(opt.device)
+            else:
+                d_features = F_d(inputs)
+            features = torch.cat((F_s(inputs), d_features), dim=1)
+            outputs = C(features)
+            _, pred = torch.max(outputs, 1)
+            confusion.add(pred.data, targets.data)
+            total += targets.size(0)
+            correct += (pred == targets).sum().item()
     acc = correct / total
     log.info('{}: Accuracy on {} samples: {}%'.format(name, total, 100.0*acc))
     log.debug(confusion.conf)
     return acc
 
 # 这个正则明天再来检查一下正确性(与公式对比)，然后再画出T-sne的图来
-def margin_regularization(inputs, targets, F_d):
-    # print(inputs[0].shape)      # torch.Size([8, 42])
-    # print(targets.shape)        # torch.Size([8, 42])
-    margin = 9
-    samples_i = []
-    samples_i_label = []
+def margin_regularization(inputs, targets, F_d, LAMBDA):
     features = F_d(inputs)
-    # print(features.shape)       # torch.Size([8, 64])
-    targets = targets.cpu()
-    for i in range(opt.batch_size):
-        samples_i.append(torch.stack([features[i] for _ in range(opt.batch_size)], 0))
-        samples_i_label.append(torch.stack([targets[i] for _ in range(opt.batch_size)], 0))
+    graph_source = torch.sum(targets[:, None, :] * targets[None, :, :], 2)
+    distance_source = torch.mean((features[:, None, :] - features[None, :, :]) ** 2, 2)
+    margin_loss = torch.mean(graph_source * distance_source + (1-graph_source)*F.relu(LAMBDA - distance_source))
+    return margin_loss
 
-    samples_i = torch.stack(samples_i, 0)
-    samples_i_label = torch.stack(samples_i_label, 0)
-    # print(samples_i.shape)      # torch.Size([8, 8, 42])
-    # print(samples_i_label.shape)    # torch.Size([8, 8])
 
-    samples_j = torch.stack([features for _ in range(opt.batch_size)], 0)  # 大x_j
-    samples_j_label = torch.stack([targets for _ in range(opt.batch_size)], 0) # 大x_j_label
-    # print(samples_j.shape)
-    # print(samples_j_label.shape)
-    mask_matrix = (samples_i_label == samples_j_label).numpy()
-    sub_matrix = (samples_i - samples_j).detach().cpu().numpy()
-    norm2_matrix = np.linalg.norm(sub_matrix, axis=2, ord=2)
-    # print(norm2_matrix)
-    result_matrix = mask_matrix * norm2_matrix + (1 - mask_matrix) * np.maximum(0, margin - norm2_matrix)
-    return np.sum(result_matrix) / (opt.batch_size ** 2)
+# 中心点约束，同域中不同class的数据尽量拉开
+# 采用hinge loss，同域之间拉开但是要看得出来这是同一个域的数据
+# 注意每次都是对一个batch中的数据进行处理(一开始时这么做)
+# def center_point_constraint(F_d_features, targets):
+#
+#     negative_features = None
+#     positive_features = None
+#     for i in range(targets.shape[0]):
+#         F_d_features_i = torch.unsqueeze(F_d_features[i], 0)
+#         if targets[i].item() == 0:
+#             if negative_features is None:
+#                 negative_features = F_d_features_i
+#             else:
+#                 negative_features = torch.cat([negative_features, F_d_features_i], 0)
+#         else:
+#             if positive_features is None:
+#                 positive_features = F_d_features_i
+#             else:
+#                 positive_features = torch.cat([positive_features, F_d_features_i], 0)
+#
+#     print(F_d_features.shape)
+#     print(negative_features.shape)
+#     print(positive_features.shape)
+#
+#     negative_features_center = torch.sum(negative_features, 0) / negative_features.shape[0]
+#     positive_features_center = torch.sum(positive_features, 0) / positive_features.shape[0]
+#
+#     # 求和后取平均版本
+#     center_loss = torch.mean(torch.sum(torch.pow(negative_features_center - positive_features_center, 2)))
+#     # 求和后不取平均版本
+#     # center_loss = torch.sum(torch.pow(negative_features_center - positive_features_center, 2))
+#     return center_loss
+
+def unsorted_segment_sum(data, segment_ids, num_segments):
+    """
+    Computes the sum along segments of a tensor. Analogous to tf.unsorted_segment_sum.
+
+    :param data: A tensor whose segments are to be summed.
+    :param segment_ids: The segment indices tensor.
+    :param num_segments: The number of segments.
+    :return: A tensor of same data type as the data argument.
+    """
+    assert all([i in data.shape for i in segment_ids.shape]), "segment_ids.shape should be a prefix of data.shape"
+
+    # segment_ids is a 1-D tensor repeat it to have the same shape as data
+    if len(segment_ids.shape) == 1:
+        s = torch.prod(torch.tensor(data.shape[1:])).long()
+        new_segment_ids = torch.from_numpy(np.repeat(segment_ids.numpy(), s))
+        new_segment_ids = new_segment_ids.view(segment_ids.shape[0], *data.shape[1:])
+        # segment_ids = segment_ids.repeat_interleave(s).view(segment_ids.shape[0], *data.shape[1:])
+
+    assert data.shape == new_segment_ids.shape, "data.shape and segment_ids.shape should be equal"
+
+    shape = [num_segments] + list(data.shape[1:])
+    tensor = torch.zeros(*shape).scatter_add(0, new_segment_ids, data.float())
+    tensor = tensor.type(data.dtype)
+    return tensor
 
 
 # 中心点约束，同域中不同class的数据尽量拉开
 # 采用hinge loss，同域之间拉开但是要看得出来这是同一个域的数据
 # 注意每次都是对一个batch中的数据进行处理(一开始时这么做)
 def center_point_constraint(F_d_features, targets):
+
     negative_features = None
     positive_features = None
     for i in range(targets.shape[0]):
@@ -473,41 +611,57 @@ def center_point_constraint(F_d_features, targets):
     print(negative_features.shape)
     print(positive_features.shape)
 
-    negative_features_center = torch.sum(negative_features, 0) / negative_features.shape[0]
-    positive_features_center = torch.sum(positive_features, 0) / positive_features.shape[0]
+    negative_samples_label = torch.zeros(negative_features.shape[0]).type(torch.LongTensor)
+    positive_samples_label = torch.ones(positive_features.shape[0]).type(torch.LongTensor)
 
-    # 先用平方loss试试看
-    norm_loss = torch.norm(negative_features_center - positive_features_center, p=2)
-    return norm_loss
-# 这个约束项先不加，它的目的是尽量缩小源域和目标域中，同一类的sample的差异
-# 但是没有target domain的特征提取器，因此先缩小源域
-# 而源域有多个，若双重for循环一一暴力匹配，则为平方复杂度
-# 因此这个约束项暂时不加
-def cluster_alignment_regularization():
-    pass
+    current_negative_samples_ones = torch.ones(negative_features.shape[0])
+    current_positive_samples_ones = torch.ones(positive_features.shape[0])
 
+    current_negative_samples_count = unsorted_segment_sum(current_negative_samples_ones, negative_samples_label, 2)
+    current_positive_samples_count = unsorted_segment_sum(current_positive_samples_ones, positive_samples_label, 2)
 
-def scatter(x, colors, species_number):
-    # We choose a color palette with seaborn.
-    palette = np.array(sns.color_palette("hls", species_number))
+    current_positive_negative_samples_count = torch.max(current_negative_samples_count,
+                                                        torch.ones_like(current_negative_samples_count))
+    current_positive_positive_samples_count = torch.max(current_positive_samples_count,
+                                                        torch.ones_like(current_positive_samples_count))
 
-    # We create a scatter plot.
-    f = plt.figure(figsize=(16, 16))
-    ax = plt.subplot(aspect='equal')
-    sc = ax.scatter(x[:,0], x[:,1], lw=0, s=40,
-                    c=palette[colors.astype(np.int)])
-    plt.xlim(-25, 25)
-    plt.ylim(-25, 25)
-    ax.axis('off')
-    ax.axis('tight')
+    current_negative_samples_centroid = torch.div(
+        unsorted_segment_sum(data=negative_features.cpu(), segment_ids=negative_samples_label, num_segments=2),
+        current_positive_negative_samples_count[:, None]).to(opt.device)
+    current_positive_samples_centroid = torch.div(
+        unsorted_segment_sum(data=positive_features.cpu(), segment_ids=positive_samples_label, num_segments=2),
+        current_positive_positive_samples_count[:, None]).to(opt.device)
 
-    return f, ax, sc
+    print("*****************************")
+    print(current_negative_samples_centroid)
+    print(current_positive_samples_centroid)
+
+    center_loss = torch.mean(torch.sqrt(torch.pow(current_negative_samples_centroid - current_positive_samples_centroid, 2)))
+    return center_loss
 
 
-def t_sne(domain, visual_features, senti_labels, species_number):
+def scatter(data, label, dir, file_name, mus=None, mark_size=2):
+    if not os.path.exists(dir):
+        os.makedirs(dir)
+
+    if label.ndim == 2:
+        label = np.argmax(label, axis=1)
+
+    df = pd.DataFrame(data={'x': data[:, 0], 'y': data[:, 1], 'class': label})
+    sns_plot = sns.lmplot('x', 'y', data=df, hue='class', fit_reg=False, scatter_kws={'s': mark_size})
+    sns_plot.savefig(os.path.join(dir, file_name))
+    if mus is not None:
+        df_mus = pd.DataFrame(
+            data={'x': mus[:, 0], 'y': mus[:, 1], 'class': np.asarray(range(mus.shape[0])).astype(np.int32)})
+        sns_plot_mus = sns.lmplot('x', 'y', data=df_mus, hue='class', fit_reg=False, scatter_kws={'s': mark_size * 20})
+        sns_plot_mus.savefig(os.path.join(dir, 'mus_' + file_name))
+
+
+def t_sne(domain, visual_features, senti_labels):
     compressed_visual_features = TSNE(random_state=2019).fit_transform(visual_features)
-    scatter(compressed_visual_features, senti_labels, species_number)
-    plt.savefig(domain + "digits_tsne-generated.png", dpi=120)
+    scatter(data=compressed_visual_features, label=senti_labels,
+            dir="./result",
+            file_name=domain + "digits_tsne-generated_new_writing_2.png")
     plt.show()
 
 
@@ -566,7 +720,7 @@ def main():
 
         print("Computing t-SNE 2D embedding")
         t0 = time()
-        t_sne(domain, visual_features.detach().cpu().numpy(), senti_labels.detach().cpu().numpy(), len(opt.domains) + 1)
+        t_sne(domain, visual_features.detach().cpu().numpy(), senti_labels.detach().cpu().numpy())
         print("t-SNE 2D embedding of the digits (time %.2fs)" % (time() - t0))
 
     log.info(f'Training done...')

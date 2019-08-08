@@ -66,13 +66,21 @@ import tensorflow as tf
 import numpy as np
 import torch
 
-y = np.array([1, 3, 4, 8 ,9])
-test = tf.square(y)
-y = torch.from_numpy(y)
-test2 = torch.pow(y, 2)
-with tf.Session() as sess:
-    test = sess.run(test)
-    print(test)
-# target_result = tf.argmax(target_pred, 1)
+# y = np.array([1, 3, 4, 8 ,9])
+# test = tf.square(y)
+# y = torch.from_numpy(y)
+# test2 = torch.pow(y, 2)
+# with tf.Session() as sess:
+#     test = sess.run(test)
+#     print(test)
+# # target_result = tf.argmax(target_pred, 1)
+#
+# print(test2)
 
-print(test2)
+# test = torch.rand(2, 128)
+# print(test)
+a = torch.Tensor([[10, 999],
+                  [1, 19]])
+# print(test / a)
+# print(torch.div(test, a))
+print(torch.sum(a, 0))

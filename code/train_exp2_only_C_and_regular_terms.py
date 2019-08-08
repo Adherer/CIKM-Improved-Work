@@ -19,6 +19,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import pandas as pd
+from center_loss import CenterLoss
 
 random.seed(opt.random_seed)
 np.random.seed(opt.random_seed)
@@ -70,6 +71,8 @@ def train(train_sets, test_sets):
     for f_d in F_d.values():
         f_d = f_d.to(opt.device)
 
+    criterion_cent = CenterLoss(num_classes=2, feat_dim=opt.domain_hidden_size, use_gpu=True)
+    optimizer_centloss = torch.optim.SGD(criterion_cent.parameters(), lr=0.5)
     optimizer = optim.Adam(itertools.chain(*map(list, [C.parameters()] + [f.parameters() for f in F_d.values()])),
                            lr=opt.learning_rate)
 
@@ -80,6 +83,9 @@ def train(train_sets, test_sets):
 
     best_acc = 0.0
     best_acc_dict = {}
+    margin = 3
+    margin_lambda = 0.1
+    # center_loss_weight_cent = 0.1
     for epoch in range(opt.max_epoch):
         C.train()
         for f in F_d.values():
@@ -87,42 +93,44 @@ def train(train_sets, test_sets):
 
         # conceptually view 1 epoch as 1 epoch of the first domain
         num_iter = len(train_loaders[opt.domains[0]])
-        for i in tqdm(range(num_iter)):
-            LAMBDA = 4
-            lambda1 = 0.1
-            lambda2 = 0.7
+        # First_stage
+        for _ in tqdm(range(num_iter)):
             for f_d in F_d.values():
                 f_d.zero_grad()
             C.zero_grad()
+            optimizer_centloss.zero_grad()
 
             for domain in opt.domains:
                 inputs, targets = utils.endless_get_next_batch(
                     train_loaders, train_iters, domain)
                 targets = targets.to(opt.device)
                 domain_feat = F_d[domain](inputs)
-                c_outputs = C(domain_feat)
+                visual_feature, c_outputs = C(domain_feat)
+                # loss_cent = criterion_cent(visual_feature, targets)
+                # loss_cent *= center_loss_weight_cent
+                loss_cent = 0.0
                 loss_part_1 = functional.nll_loss(c_outputs, targets)
-
                 targets = targets.unsqueeze(1)
                 targets_onehot = torch.FloatTensor(opt.batch_size, 2)
                 targets_onehot.zero_()
                 targets_onehot.scatter_(1, targets.cpu(), 1)
                 targets_onehot = targets_onehot.to(opt.device)
-                loss_part_2 = lambda1 * margin_regularization(inputs, targets_onehot, F_d[domain], LAMBDA)
+                loss_part_2 = margin_lambda * margin_regularization(inputs, targets_onehot, F_d[domain], C, margin)
+                # loss_part_2 = 0.0
 
-                loss_part_3 = -lambda2 * center_point_constraint(domain_feat, targets)
-                print("lambda1: " + str(lambda1))
-                print("lambda2: " + str(lambda2))
                 print("loss_part_1: " + str(loss_part_1))
                 print("loss_part_2: " + str(loss_part_2))
-                print("loss_part_3: " + str(loss_part_3))
-                l_c = loss_part_1 + loss_part_2 + loss_part_3
+                print("loss_cent: " + str(loss_cent))
+                l_c = loss_part_1 + loss_part_2 + loss_cent
                 l_c.backward()
                 _, pred = torch.max(c_outputs, 1)
                 total[domain] += targets.size(0)
                 correct[domain] += (pred == targets).sum().item()
 
             optimizer.step()
+            # for param in criterion_cent.parameters():
+            #     param.grad.data *= (1. / center_loss_weight_cent)
+            optimizer_centloss.step()
 
         # end of epoch
         log.info('Ending epoch {}'.format(epoch+1))
@@ -155,26 +163,29 @@ def train(train_sets, test_sets):
         F_d[domain].load_state_dict(torch.load(os.path.join(opt.exp2_model_save_file,
                                                             f'net_F_d_{domain}.pth')))
     num_iter = len(train_loaders[opt.domains[0]])
-    visual_features, senti_labels = get_visual_features(num_iter, test_loaders, test_iters, F_d)
+    visual_features, senti_labels = get_visual_features(num_iter, test_loaders, test_iters, F_d, C)
+    # visual_features, senti_labels = get_visual_features(num_iter, train_loaders, train_iters, F_d)
     return best_acc, best_acc_dict, visual_features, senti_labels
 
 
 # 这个正则明天再来检查一下正确性(与公式对比)，然后再画出T-sne的图来
-def margin_regularization(inputs, targets, F_d, LAMBDA):
-    features = F_d(inputs)
+def margin_regularization(inputs, targets, F_d, C, margin):
+    private_features = F_d(inputs)
+    visual_feature, _ = C(private_features)
     graph_source = torch.sum(targets[:, None, :] * targets[None, :, :], 2)
-    distance_source = torch.mean((features[:, None, :] - features[None, :, :]) ** 2, 2)
-    margin_loss = torch.mean(graph_source * distance_source + (1-graph_source)*F.relu(LAMBDA - distance_source))
+    distance_source = torch.mean((visual_feature[:, None, :] - visual_feature[None, :, :]) ** 2, 2)
+    margin_loss = torch.mean(graph_source * distance_source + (1-graph_source)*F.relu(margin - distance_source))
     return margin_loss
 
 
-def get_visual_features(num_iter, test_loaders, test_iters, F_d):
+def get_visual_features(num_iter, test_loaders, test_iters, F_d, C):
     visual_features, senti_labels = None, None
     for _ in tqdm(range(num_iter)):
         for domain in opt.domains:
             d_inputs, targets = utils.endless_get_next_batch(
                 test_loaders, test_iters, domain)
             private_features = F_d[domain](d_inputs)
+            # private_features, _ = C(private_features)
             if visual_features is None:
                 visual_features = private_features
                 senti_labels = targets
@@ -200,7 +211,7 @@ def evaluate(name, loader, F_d, C):
             d_features = torch.zeros(len(targets), opt.domain_hidden_size).to(opt.device)
         else:
             d_features = F_d(inputs)
-        outputs = C(d_features)
+        _, outputs = C(d_features)
         _, pred = torch.max(outputs, 1)
         confusion.add(pred.data, targets.data)
         total += targets.size(0)
@@ -232,7 +243,7 @@ def t_sne(domain, visual_features, senti_labels):
     compressed_visual_features = TSNE(random_state=2019).fit_transform(visual_features)
     scatter(data=compressed_visual_features, label=senti_labels,
             dir="./result",
-            file_name=domain + "digits_tsne-generated_new_writing_2.png")
+            file_name=domain + "_center_loss.png")
     plt.show()
 
 

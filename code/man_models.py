@@ -165,12 +165,52 @@ class MlpFeatureExtractor(nn.Module):
         self.net.add_module('f-linear-final', nn.Linear(hidden_sizes[-1], output_size))
         if batch_norm:
             self.net.add_module('f-bn-final', nn.BatchNorm1d(output_size))
-        # self.net.add_module('f-relu-final', opt.act_unit)
+        self.net.add_module('f-relu-final', opt.act_unit)
 
     def forward(self, input):
         return self.net(input)
 
 
+# class MlpFeatureExtractor(nn.Module):
+#     def __init__(self,
+#                  input_size,
+#                  hidden_sizes,
+#                  output_size,
+#                  dropout,
+#                  batch_norm=False):
+#         super(MlpFeatureExtractor, self).__init__()
+#         self.hidden_sizes = hidden_sizes
+#         self.embedding_net = nn.Sequential()
+#         self.feature_net = nn.Sequential()
+#         # num_layers = len(hidden_sizes)
+#         # for i in range(num_layers):
+#         #     if dropout > 0:
+#         #         self.net.add_module('f-dropout-{}'.format(i), nn.Dropout(p=dropout))
+#         #     if i == 0:
+#         #         self.net.add_module('f-linear-{}'.format(i), nn.Linear(input_size, hidden_sizes[0]))
+#         #     else:
+#         #         self.net.add_module('f-linear-{}'.format(i), nn.Linear(hidden_sizes[i-1], hidden_sizes[i]))
+#         #     if batch_norm:
+#         #         self.net.add_module('f-bn-{}'.format(i), nn.BatchNorm1d(hidden_sizes[i]))
+#         #     self.net.add_module('f-relu-{}'.format(i), opt.act_unit)
+#
+#
+#
+#         self.embedding_net.add_module('f-linear-embedding', nn.Linear(input_size, hidden_sizes[-1]))
+#         if dropout > 0:
+#             self.feature_net.add_module('f-dropout-final', nn.Dropout(p=dropout))
+#         self.feature_net.add_module('f-linear-final', nn.Linear(hidden_sizes[-1], output_size))
+#         if batch_norm:
+#             self.feature_net.add_module('f-bn-final', nn.BatchNorm1d(output_size))
+#         self.feature_net.add_module('f-relu-final', opt.act_unit)
+#
+#     def forward(self, input):
+#         embedding_feature = self.embedding_net(input)
+#         F_d_feature = self.em
+#         return self.net(input)
+
+
+# 最后可视化的特征与网络结构有着莫大的联系，回来继续思考！
 class SentimentClassifier(nn.Module):
     def __init__(self,
                  num_layers,
@@ -182,23 +222,58 @@ class SentimentClassifier(nn.Module):
         super(SentimentClassifier, self).__init__()
         assert num_layers >= 0, 'Invalid layer numbers'
         self.hidden_size = hidden_size
-        self.net = nn.Sequential()
+        self.feature_net = nn.Sequential()
+        self.classifier_net = nn.Sequential()
         for i in range(num_layers):
             if dropout > 0:
-                self.net.add_module('p-dropout-{}'.format(i), nn.Dropout(p=dropout))
+                self.feature_net.add_module('p-dropout-{}'.format(i), nn.Dropout(p=dropout))
             if i == 0:
-                self.net.add_module('p-linear-{}'.format(i), nn.Linear(input_size, hidden_size))
+                self.feature_net.add_module('p-linear-{}'.format(i), nn.Linear(input_size, hidden_size))
             else:
-                self.net.add_module('p-linear-{}'.format(i), nn.Linear(hidden_size, hidden_size))
+                self.feature_net.add_module('p-linear-{}'.format(i), nn.Linear(hidden_size, hidden_size))
             if batch_norm:
-                self.net.add_module('p-bn-{}'.format(i), nn.BatchNorm1d(hidden_size))
-            self.net.add_module('p-relu-{}'.format(i), opt.act_unit)
+                self.feature_net.add_module('p-bn-{}'.format(i), nn.BatchNorm1d(hidden_size))
+            self.feature_net.add_module('p-relu-{}'.format(i), opt.act_unit)
 
-        self.net.add_module('p-linear-final', nn.Linear(hidden_size, output_size))
-        self.net.add_module('p-logsoftmax', nn.LogSoftmax(dim=-1))
+        self.classifier_net.add_module('p-linear-final', nn.Linear(hidden_size, output_size))
+        # self.feature_net.add_module('p-linear-visual', nn.Linear(hidden_size, output_size))
+        # self.classifier_net.add_module('p-linear-final', nn.Linear(output_size, output_size))
+        self.classifier_net.add_module('p-logsoftmax', nn.LogSoftmax(dim=-1))
 
     def forward(self, input):
-        return self.net(input)
+        visual_feature = self.feature_net(input)
+        result = self.classifier_net(visual_feature)
+        return visual_feature, result
+
+
+# class SentimentClassifier(nn.Module):
+#     def __init__(self,
+#                  num_layers,
+#                  input_size,
+#                  hidden_size,
+#                  output_size,
+#                  dropout,
+#                  batch_norm=False):
+#         super(SentimentClassifier, self).__init__()
+#         assert num_layers >= 0, 'Invalid layer numbers'
+#         self.hidden_size = hidden_size
+#         self.net = nn.Sequential()
+#         for i in range(num_layers):
+#             if dropout > 0:
+#                 self.net.add_module('p-dropout-{}'.format(i), nn.Dropout(p=dropout))
+#             if i == 0:
+#                 self.net.add_module('p-linear-{}'.format(i), nn.Linear(input_size, hidden_size))
+#             else:
+#                 self.net.add_module('p-linear-{}'.format(i), nn.Linear(hidden_size, hidden_size))
+#             if batch_norm:
+#                 self.net.add_module('p-bn-{}'.format(i), nn.BatchNorm1d(hidden_size))
+#             self.net.add_module('p-relu-{}'.format(i), opt.act_unit)
+#
+#         self.net.add_module('p-linear-final', nn.Linear(hidden_size, output_size))
+#         self.net.add_module('p-logsoftmax', nn.LogSoftmax(dim=-1))
+#
+#     def forward(self, input):
+#         return self.net(input)
 
 
 class DomainClassifier(nn.Module):

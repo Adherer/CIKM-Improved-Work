@@ -24,7 +24,7 @@ parser.add_argument('--max_seq_len', type=int, default=0) # set to <=0 to not tr
 parser.add_argument('--unlabeled_data', type=str, default='both')
 parser.add_argument('--random_seed', type=int, default=1)
 parser.add_argument('--exp2_target_model_save_file', default='./save/man_exp2/target_save')
-parser.add_argument('--exp2_model_save_file', default='./save/man_exp2/exp1')
+parser.add_argument('--exp2_model_save_file', default='./save/man_exp2/exp4')
 parser.add_argument('--exp3_model_save_file', default='./save/man_exp3')
 
 parser.add_argument('--test_only', dest='test_only', action='store_true')
@@ -54,7 +54,7 @@ parser.add_argument('--F_hidden_sizes', type=int, nargs='+', default=[1000, 500]
 # it's nearly equivalent to the GR (NLL) loss
 parser.add_argument('--loss', default='gr')
 parser.add_argument('--shared_hidden_size', type=int, default=128)
-parser.add_argument('--domain_hidden_size', type=int, default=1024)
+parser.add_argument('--domain_hidden_size', type=int, default=128)
 parser.add_argument('--activation', default='relu') # relu, leaky
 parser.add_argument('--F_layers', type=int, default=1)
 parser.add_argument('--C_layers', type=int, default=1)
@@ -64,6 +64,7 @@ parser.add_argument('--no_wgan_trick/', dest='wgan_trick', action='store_false')
 parser.add_argument('--n_critic', type=int, default=5) # hyperparameter k in the paper
 parser.add_argument('--shared_lambd', type=float, default=0.05)
 parser.add_argument('--private_lambd', type=float, default=0.025)
+parser.add_argument('--lambd', type=float, default=0.05)
 
 # batch normalization
 parser.add_argument('--F_bn/', dest='F_bn', action='store_true', default=False)

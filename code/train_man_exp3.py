@@ -1,9 +1,9 @@
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "5"
 from collections import defaultdict
 import itertools
 import logging
 import math
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "7"
 import pickle
 import random
 import sys
